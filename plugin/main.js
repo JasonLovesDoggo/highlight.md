@@ -29,11 +29,12 @@ var import_obsidian = require("obsidian");
 
 // src/annotations.ts
 function parseHighlightData(value) {
-  const empty = { mode: "markdown", annotations: [] };
+  const empty = { mode: "markdown", visible: true, annotations: [] };
   if (typeof value !== "object" || value === null) return empty;
   const mode = "mode" in value && value.mode === "overlay" ? "overlay" : "markdown";
+  const visible = !("visible" in value) || value.visible !== false;
   if (!("annotations" in value) || !Array.isArray(value.annotations)) {
-    return { mode, annotations: [] };
+    return { mode, visible, annotations: [] };
   }
   const annotations = [];
   for (const item of value.annotations) {
@@ -57,7 +58,7 @@ function parseHighlightData(value) {
       createdAt: item.createdAt
     });
   }
-  return { mode, annotations };
+  return { mode, visible, annotations };
 }
 function createAnnotation(path, contents, offset, quote, comment = "") {
   return {
@@ -110,13 +111,21 @@ function isHighlightAround(before, after) {
 // src/plugin/main.ts
 var refreshAnnotations = import_state.StateEffect.define();
 var AiHighlightPlugin = class extends import_obsidian.Plugin {
-  data = { mode: "markdown", annotations: [] };
+  data = { mode: "markdown", visible: true, annotations: [] };
   editors = /* @__PURE__ */ new Set();
   pendingSave = Promise.resolve();
+  popover = null;
+  popoverAnnotationId = null;
+  dismissedAnnotationId = null;
   async onload() {
     this.data = parseHighlightData(await this.loadData());
     this.addSettingTab(new HighlightSettingsTab(this.app, this));
     this.registerEditorExtension(this.annotationExtension());
+    this.registerDomEvent(document, "mouseover", (event) => this.onMouseOver(event));
+    this.registerDomEvent(document, "mouseout", (event) => this.onMouseOut(event));
+    this.registerDomEvent(document, "keydown", (event) => {
+      if (event.key === "Escape") this.hidePopover();
+    });
     this.addCommand({
       id: "highlight-selection",
       name: "Highlight selected text",
@@ -158,6 +167,32 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
         }).open();
       }
     });
+    this.addCommand({
+      id: "hide-all-annotations",
+      name: "Hide all annotations",
+      callback: () => {
+        void this.setVisible(false);
+      }
+    });
+    this.addCommand({
+      id: "show-all-annotations",
+      name: "Show all annotations",
+      callback: () => {
+        void this.setVisible(true);
+      }
+    });
+    this.addCommand({
+      id: "remove-all-annotations",
+      name: "Remove all annotations",
+      callback: () => {
+        new ConfirmRemoveAllModal(this.app, this.data.annotations.length, () => {
+          void this.removeAllAnnotations();
+        }).open();
+      }
+    });
+  }
+  onunload() {
+    this.hidePopover();
   }
   async onExternalSettingsChange() {
     await this.pendingSave;
@@ -167,9 +202,16 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
   get mode() {
     return this.data.mode;
   }
+  get visible() {
+    return this.data.visible;
+  }
   async setMode(mode) {
     await this.updateData((data) => ({ ...data, mode }));
     new import_obsidian.Notice(`Highlight mode: ${mode === "overlay" ? "Annotations" : "Markdown"}`);
+  }
+  async setVisible(visible) {
+    await this.updateData((data) => ({ ...data, visible }));
+    new import_obsidian.Notice(visible ? "Annotations shown." : "Annotations hidden.");
   }
   async highlightSelection(editor, path) {
     const quote = editor.getSelection();
@@ -210,11 +252,17 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
         throw new Error("This selection cannot be anchored uniquely. Select a longer passage.");
       }
       await this.updateData((data) => {
-        const exists = data.annotations.some((current) => current.path === path && current.quote === quote && locateAnnotation(contents, current) === offset);
-        if (exists) throw new Error("That selection already has an annotation.");
+        const existing = data.annotations.find((current) => current.path === path && current.quote === quote && locateAnnotation(contents, current) === offset);
+        if (existing) {
+          if (!comment) throw new Error("That selection already has an annotation.");
+          return {
+            ...data,
+            annotations: data.annotations.map((current) => current.id === existing.id ? { ...current, comment } : current)
+          };
+        }
         return { ...data, annotations: [...data.annotations, annotation] };
       });
-      new import_obsidian.Notice(comment ? "Comment added." : "Annotation highlight added.");
+      new import_obsidian.Notice(comment ? "Comment saved." : "Annotation highlight added.");
     } catch (error) {
       new import_obsidian.Notice(error instanceof Error ? error.message : String(error));
     }
@@ -226,11 +274,16 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
     }));
     new import_obsidian.Notice("Annotation removed.");
   }
+  async removeAllAnnotations() {
+    await this.updateData((data) => ({ ...data, annotations: [] }));
+    new import_obsidian.Notice("All annotations removed.");
+  }
   updateData(change) {
     const result = this.pendingSave.then(async () => {
       const updated = change(parseHighlightData(await this.loadData()));
       await this.saveData(updated);
       this.data = updated;
+      this.hidePopover();
       this.refreshEditors();
     });
     this.pendingSave = result.catch(() => void 0);
@@ -260,6 +313,7 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
         owner.editors.delete(this.view);
       }
       build() {
+        if (!owner.data.visible) return import_view.Decoration.none;
         const path = this.view.state.field(import_obsidian.editorInfoField).file?.path;
         if (!path) return import_view.Decoration.none;
         const contents = this.view.state.doc.toString();
@@ -273,8 +327,69 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
     if (from === null) return null;
     return import_view.Decoration.mark({
       class: "ai-highlight-annotation",
-      attributes: { title: annotation.comment || "Annotation highlight" }
+      attributes: { "data-annotation-id": annotation.id }
     }).range(from, from + annotation.quote.length);
+  }
+  onMouseOver(event) {
+    if (!this.data.visible || !(event.target instanceof Element)) return;
+    const mark = event.target.closest(".ai-highlight-annotation");
+    if (!mark) return;
+    const id = mark.dataset.annotationId;
+    if (!id || id === this.dismissedAnnotationId || id === this.popoverAnnotationId) return;
+    const annotation = this.data.annotations.find((item) => item.id === id);
+    if (!annotation?.comment) return;
+    this.showPopover(mark, annotation);
+  }
+  onMouseOut(event) {
+    if (!(event.target instanceof Element)) return;
+    const mark = event.target.closest(".ai-highlight-annotation");
+    if (!mark) return;
+    if (event.relatedTarget instanceof Node && mark.contains(event.relatedTarget)) return;
+    this.dismissedAnnotationId = null;
+  }
+  showPopover(mark, annotation) {
+    this.hidePopover();
+    const card = document.createElement("div");
+    card.className = "ai-highlight-comment-card";
+    card.setAttribute("role", "dialog");
+    card.setAttribute("aria-label", "Annotation comment");
+    const quote = document.createElement("div");
+    quote.className = "ai-highlight-comment-quote";
+    quote.textContent = annotation.quote.length > 120 ? `${annotation.quote.slice(0, 120)}\u2026` : annotation.quote;
+    card.append(quote);
+    const comment = document.createElement("div");
+    comment.className = "ai-highlight-comment-text";
+    comment.textContent = annotation.comment;
+    card.append(comment);
+    const actions = document.createElement("div");
+    actions.className = "ai-highlight-comment-actions";
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.textContent = "Dismiss";
+    dismiss.addEventListener("click", () => {
+      this.dismissedAnnotationId = annotation.id;
+      this.hidePopover();
+    });
+    actions.append(dismiss);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Remove annotation";
+    remove.addEventListener("click", () => {
+      void this.removeAnnotation(annotation.id);
+    });
+    actions.append(remove);
+    card.append(actions);
+    document.body.append(card);
+    const rect = mark.getBoundingClientRect();
+    card.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - card.offsetWidth - 8))}px`;
+    card.style.top = `${rect.bottom + card.offsetHeight + 8 > window.innerHeight ? Math.max(8, rect.top - card.offsetHeight - 8) : rect.bottom + 8}px`;
+    this.popover = card;
+    this.popoverAnnotationId = annotation.id;
+  }
+  hidePopover() {
+    this.popover?.remove();
+    this.popover = null;
+    this.popoverAnnotationId = null;
   }
 };
 var HighlightSettingsTab = class extends import_obsidian.PluginSettingTab {
@@ -287,6 +402,9 @@ var HighlightSettingsTab = class extends import_obsidian.PluginSettingTab {
     this.containerEl.empty();
     new import_obsidian.Setting(this.containerEl).setName("Highlight mode").setDesc("Markdown changes the note. Annotations are stored in the plugin data and drawn over the editor.").addDropdown((dropdown) => dropdown.addOption("markdown", "Markdown markup").addOption("overlay", "Annotations (no note changes)").setValue(this.owner.mode).onChange((value) => {
       if (value === "markdown" || value === "overlay") void this.owner.setMode(value);
+    }));
+    new import_obsidian.Setting(this.containerEl).setName("Show annotations").setDesc("Hide overlay highlights and comment cards without deleting them.").addToggle((toggle) => toggle.setValue(this.owner.visible).onChange((value) => {
+      void this.owner.setVisible(value);
     }));
   }
 };
@@ -332,6 +450,28 @@ var AnnotationsModal = class extends import_obsidian.Modal {
         this.close();
       }));
     }
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var ConfirmRemoveAllModal = class extends import_obsidian.Modal {
+  constructor(app, count, confirm) {
+    super(app);
+    this.count = count;
+    this.confirm = confirm;
+  }
+  count;
+  confirm;
+  onOpen() {
+    this.setTitle("Remove all annotations?");
+    this.contentEl.createEl("p", {
+      text: `This will delete all ${this.count} saved annotations and comments from this vault. The Markdown notes will stay unchanged.`
+    });
+    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("Cancel").onClick(() => this.close())).addButton((button) => button.setButtonText("Remove all").setWarning().onClick(() => {
+      this.close();
+      this.confirm();
+    }));
   }
   onClose() {
     this.contentEl.empty();

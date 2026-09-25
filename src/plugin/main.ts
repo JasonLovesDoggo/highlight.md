@@ -7,14 +7,22 @@ import { highlightMarkup, isHighlightAround } from "../markup.js"
 const refreshAnnotations = StateEffect.define<null>()
 
 export default class AiHighlightPlugin extends Plugin {
-  private data: HighlightData = { mode: "markdown", annotations: [] }
+  private data: HighlightData = { mode: "markdown", visible: true, annotations: [] }
   private readonly editors = new Set<EditorView>()
   private pendingSave: Promise<void> = Promise.resolve()
+  private popover: HTMLElement | null = null
+  private popoverAnnotationId: string | null = null
+  private dismissedAnnotationId: string | null = null
 
   async onload(): Promise<void> {
     this.data = parseHighlightData(await this.loadData())
     this.addSettingTab(new HighlightSettingsTab(this.app, this))
     this.registerEditorExtension(this.annotationExtension())
+    this.registerDomEvent(document, "mouseover", (event) => this.onMouseOver(event))
+    this.registerDomEvent(document, "mouseout", (event) => this.onMouseOut(event))
+    this.registerDomEvent(document, "keydown", (event) => {
+      if (event.key === "Escape") this.hidePopover()
+    })
     this.addCommand({
       id: "highlight-selection",
       name: "Highlight selected text",
@@ -56,6 +64,29 @@ export default class AiHighlightPlugin extends Plugin {
         }).open()
       },
     })
+    this.addCommand({
+      id: "hide-all-annotations",
+      name: "Hide all annotations",
+      callback: () => { void this.setVisible(false) },
+    })
+    this.addCommand({
+      id: "show-all-annotations",
+      name: "Show all annotations",
+      callback: () => { void this.setVisible(true) },
+    })
+    this.addCommand({
+      id: "remove-all-annotations",
+      name: "Remove all annotations",
+      callback: () => {
+        new ConfirmRemoveAllModal(this.app, this.data.annotations.length, () => {
+          void this.removeAllAnnotations()
+        }).open()
+      },
+    })
+  }
+
+  onunload(): void {
+    this.hidePopover()
   }
 
   async onExternalSettingsChange(): Promise<void> {
@@ -68,9 +99,18 @@ export default class AiHighlightPlugin extends Plugin {
     return this.data.mode
   }
 
+  get visible(): boolean {
+    return this.data.visible
+  }
+
   async setMode(mode: HighlightData["mode"]): Promise<void> {
     await this.updateData((data) => ({ ...data, mode }))
     new Notice(`Highlight mode: ${mode === "overlay" ? "Annotations" : "Markdown"}`)
+  }
+
+  async setVisible(visible: boolean): Promise<void> {
+    await this.updateData((data) => ({ ...data, visible }))
+    new Notice(visible ? "Annotations shown." : "Annotations hidden.")
   }
 
   private async highlightSelection(editor: Editor, path: string | undefined): Promise<void> {
@@ -113,11 +153,17 @@ export default class AiHighlightPlugin extends Plugin {
         throw new Error("This selection cannot be anchored uniquely. Select a longer passage.")
       }
       await this.updateData((data) => {
-        const exists = data.annotations.some((current) => current.path === path && current.quote === quote && locateAnnotation(contents, current) === offset)
-        if (exists) throw new Error("That selection already has an annotation.")
+        const existing = data.annotations.find((current) => current.path === path && current.quote === quote && locateAnnotation(contents, current) === offset)
+        if (existing) {
+          if (!comment) throw new Error("That selection already has an annotation.")
+          return {
+            ...data,
+            annotations: data.annotations.map((current) => current.id === existing.id ? { ...current, comment } : current),
+          }
+        }
         return { ...data, annotations: [...data.annotations, annotation] }
       })
-      new Notice(comment ? "Comment added." : "Annotation highlight added.")
+      new Notice(comment ? "Comment saved." : "Annotation highlight added.")
     } catch (error) {
       new Notice(error instanceof Error ? error.message : String(error))
     }
@@ -131,11 +177,17 @@ export default class AiHighlightPlugin extends Plugin {
     new Notice("Annotation removed.")
   }
 
+  private async removeAllAnnotations(): Promise<void> {
+    await this.updateData((data) => ({ ...data, annotations: [] }))
+    new Notice("All annotations removed.")
+  }
+
   private updateData(change: (data: HighlightData) => HighlightData): Promise<void> {
     const result = this.pendingSave.then(async () => {
       const updated = change(parseHighlightData(await this.loadData()))
       await this.saveData(updated)
       this.data = updated
+      this.hidePopover()
       this.refreshEditors()
     })
     this.pendingSave = result.catch(() => undefined)
@@ -165,6 +217,7 @@ export default class AiHighlightPlugin extends Plugin {
         owner.editors.delete(this.view)
       }
       private build(): DecorationSet {
+        if (!owner.data.visible) return Decoration.none
         const path = this.view.state.field(editorInfoField).file?.path
         if (!path) return Decoration.none
         const contents = this.view.state.doc.toString()
@@ -183,8 +236,71 @@ export default class AiHighlightPlugin extends Plugin {
     if (from === null) return null
     return Decoration.mark({
       class: "ai-highlight-annotation",
-      attributes: { title: annotation.comment || "Annotation highlight" },
+      attributes: { "data-annotation-id": annotation.id },
     }).range(from, from + annotation.quote.length)
+  }
+
+  private onMouseOver(event: MouseEvent): void {
+    if (!this.data.visible || !(event.target instanceof Element)) return
+    const mark = event.target.closest<HTMLElement>(".ai-highlight-annotation")
+    if (!mark) return
+    const id = mark.dataset.annotationId
+    if (!id || id === this.dismissedAnnotationId || id === this.popoverAnnotationId) return
+    const annotation = this.data.annotations.find((item) => item.id === id)
+    if (!annotation?.comment) return
+    this.showPopover(mark, annotation)
+  }
+
+  private onMouseOut(event: MouseEvent): void {
+    if (!(event.target instanceof Element)) return
+    const mark = event.target.closest<HTMLElement>(".ai-highlight-annotation")
+    if (!mark) return
+    if (event.relatedTarget instanceof Node && mark.contains(event.relatedTarget)) return
+    this.dismissedAnnotationId = null
+  }
+
+  private showPopover(mark: HTMLElement, annotation: Annotation): void {
+    this.hidePopover()
+    const card = document.createElement("div")
+    card.className = "ai-highlight-comment-card"
+    card.setAttribute("role", "dialog")
+    card.setAttribute("aria-label", "Annotation comment")
+    const quote = document.createElement("div")
+    quote.className = "ai-highlight-comment-quote"
+    quote.textContent = annotation.quote.length > 120 ? `${annotation.quote.slice(0, 120)}…` : annotation.quote
+    card.append(quote)
+    const comment = document.createElement("div")
+    comment.className = "ai-highlight-comment-text"
+    comment.textContent = annotation.comment
+    card.append(comment)
+    const actions = document.createElement("div")
+    actions.className = "ai-highlight-comment-actions"
+    const dismiss = document.createElement("button")
+    dismiss.type = "button"
+    dismiss.textContent = "Dismiss"
+    dismiss.addEventListener("click", () => {
+      this.dismissedAnnotationId = annotation.id
+      this.hidePopover()
+    })
+    actions.append(dismiss)
+    const remove = document.createElement("button")
+    remove.type = "button"
+    remove.textContent = "Remove annotation"
+    remove.addEventListener("click", () => { void this.removeAnnotation(annotation.id) })
+    actions.append(remove)
+    card.append(actions)
+    document.body.append(card)
+    const rect = mark.getBoundingClientRect()
+    card.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - card.offsetWidth - 8))}px`
+    card.style.top = `${rect.bottom + card.offsetHeight + 8 > window.innerHeight ? Math.max(8, rect.top - card.offsetHeight - 8) : rect.bottom + 8}px`
+    this.popover = card
+    this.popoverAnnotationId = annotation.id
+  }
+
+  private hidePopover(): void {
+    this.popover?.remove()
+    this.popover = null
+    this.popoverAnnotationId = null
   }
 }
 
@@ -204,6 +320,12 @@ class HighlightSettingsTab extends PluginSettingTab {
         .onChange((value) => {
           if (value === "markdown" || value === "overlay") void this.owner.setMode(value)
         }))
+    new Setting(this.containerEl)
+      .setName("Show annotations")
+      .setDesc("Hide overlay highlights and comment cards without deleting them.")
+      .addToggle((toggle) => toggle
+        .setValue(this.owner.visible)
+        .onChange((value) => { void this.owner.setVisible(value) }))
   }
 }
 
@@ -256,6 +378,32 @@ class AnnotationsModal extends Modal {
             this.close()
           }))
     }
+  }
+  onClose(): void {
+    this.contentEl.empty()
+  }
+}
+
+class ConfirmRemoveAllModal extends Modal {
+  constructor(app: App, private readonly count: number, private readonly confirm: () => void) {
+    super(app)
+  }
+  onOpen(): void {
+    this.setTitle("Remove all annotations?")
+    this.contentEl.createEl("p", {
+      text: `This will delete all ${this.count} saved annotations and comments from this vault. The Markdown notes will stay unchanged.`,
+    })
+    new Setting(this.contentEl)
+      .addButton((button) => button
+        .setButtonText("Cancel")
+        .onClick(() => this.close()))
+      .addButton((button) => button
+        .setButtonText("Remove all")
+        .setWarning()
+        .onClick(() => {
+          this.close()
+          this.confirm()
+        }))
   }
   onClose(): void {
     this.contentEl.empty()

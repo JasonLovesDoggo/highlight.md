@@ -129,7 +129,9 @@ async function main(): Promise<void> {
       try {
         if (mode === "overlay") {
           const result = await vault.annotate(path, text, occurrence, comment)
-          const message = result.alreadyAnnotated
+          const message = result.commentUpdated
+            ? `Updated the comment for annotation ${result.id} in ${result.path}.`
+            : result.alreadyAnnotated
             ? `That selection already has an annotation in ${result.path} (ID ${result.id}).`
             : `Annotated occurrence ${result.occurrence} in ${result.path} without changing the note (ID ${result.id}).`
           return { content: [{ type: "text", text: message }] }

@@ -13,16 +13,18 @@ export interface Annotation {
 
 export interface HighlightData {
   mode: HighlightMode
+  visible: boolean
   annotations: Annotation[]
 }
 
 export function parseHighlightData(value: unknown): HighlightData {
-  const empty: HighlightData = { mode: "markdown", annotations: [] }
+  const empty: HighlightData = { mode: "markdown", visible: true, annotations: [] }
   if (typeof value !== "object" || value === null) return empty
 
   const mode = "mode" in value && value.mode === "overlay" ? "overlay" : "markdown"
+  const visible = !("visible" in value) || value.visible !== false
   if (!("annotations" in value) || !Array.isArray(value.annotations)) {
-    return { mode, annotations: [] }
+    return { mode, visible, annotations: [] }
   }
 
   const annotations: Annotation[] = []
@@ -41,7 +43,7 @@ export function parseHighlightData(value: unknown): HighlightData {
       suffix: item.suffix, offset: item.offset, comment: item.comment, createdAt: item.createdAt,
     })
   }
-  return { mode, annotations }
+  return { mode, visible, annotations }
 }
 
 export function createAnnotation(path: string, contents: string, offset: number, quote: string, comment = ""): Annotation {

@@ -22,6 +22,7 @@ export interface AnnotationResult {
   id: string
   occurrence: number
   alreadyAnnotated: boolean
+  commentUpdated: boolean
 }
 
 export class VaultFiles {
@@ -92,7 +93,7 @@ export class VaultFiles {
       if (offset === undefined) throw new Error(`Occurrence ${selectedOccurrence} is outside the ${offsets.length} matches.`)
 
       const dataPath = await this.pluginDataPath()
-      let data: HighlightData = { mode: "markdown", annotations: [] }
+      let data: HighlightData = { mode: "markdown", visible: true, annotations: [] }
       try {
         const info = await lstat(dataPath)
         if (!info.isFile() || info.isSymbolicLink()) throw new Error("Plugin data must be a regular file.")
@@ -102,22 +103,22 @@ export class VaultFiles {
       }
       const existing = data.annotations.find((annotation) => annotation.path === relativePath && annotation.quote === text && locateAnnotation(contents, annotation) === offset)
       if (existing) {
-        return { path: relativePath, id: existing.id, occurrence: selectedOccurrence, alreadyAnnotated: true }
+        if (!comment || comment === existing.comment) {
+          return { path: relativePath, id: existing.id, occurrence: selectedOccurrence, alreadyAnnotated: true, commentUpdated: false }
+        }
+        await this.writePluginData(dataPath, {
+          ...data,
+          annotations: data.annotations.map((annotation) => annotation.id === existing.id ? { ...annotation, comment } : annotation),
+        })
+        return { path: relativePath, id: existing.id, occurrence: selectedOccurrence, alreadyAnnotated: true, commentUpdated: true }
       }
       const annotation = createAnnotation(relativePath, contents, offset, text, comment)
       if (locateAnnotation(contents, annotation) !== offset) {
         throw new Error("This selection cannot be anchored uniquely. Choose a longer passage.")
       }
       const updated = { ...data, annotations: [...data.annotations, annotation] }
-      const temporaryPath = `${dataPath}.${process.pid}.${Date.now()}.tmp`
-      try {
-        await writeFile(temporaryPath, JSON.stringify(updated, null, 2), { encoding: "utf8", flag: "wx" })
-        await rename(temporaryPath, dataPath)
-      } catch (error) {
-        await unlink(temporaryPath).catch(() => undefined)
-        throw error
-      }
-      return { path: relativePath, id: annotation.id, occurrence: selectedOccurrence, alreadyAnnotated: false }
+      await this.writePluginData(dataPath, updated)
+      return { path: relativePath, id: annotation.id, occurrence: selectedOccurrence, alreadyAnnotated: false, commentUpdated: false }
     })
   }
 
@@ -136,6 +137,17 @@ export class VaultFiles {
       }
     }
     return path.join(current, "data.json")
+  }
+
+  private async writePluginData(dataPath: string, data: HighlightData): Promise<void> {
+    const temporaryPath = `${dataPath}.${process.pid}.${Date.now()}.tmp`
+    try {
+      await writeFile(temporaryPath, JSON.stringify(data, null, 2), { encoding: "utf8", flag: "wx" })
+      await rename(temporaryPath, dataPath)
+    } catch (error) {
+      await unlink(temporaryPath).catch(() => undefined)
+      throw error
+    }
   }
 
   private async highlightUnlocked(relativePath: string, text: string, occurrence?: number): Promise<HighlightResult> {
