@@ -8,6 +8,7 @@ export interface Annotation {
   suffix: string
   offset: number
   comment: string
+  suggestion?: string
   createdAt: string
 }
 
@@ -37,21 +38,23 @@ export function parseHighlightData(value: unknown): HighlightData {
     if (!("suffix" in item) || typeof item.suffix !== "string") continue
     if (!("offset" in item) || typeof item.offset !== "number" || !Number.isSafeInteger(item.offset) || item.offset < 0) continue
     if (!("comment" in item) || typeof item.comment !== "string") continue
+    if ("suggestion" in item && typeof item.suggestion !== "string") continue
     if (!("createdAt" in item) || typeof item.createdAt !== "string") continue
     annotations.push({
       id: item.id, path: item.path, quote: item.quote, prefix: item.prefix,
       suffix: item.suffix, offset: item.offset, comment: item.comment, createdAt: item.createdAt,
+      ...(typeof item.suggestion === "string" ? { suggestion: item.suggestion } : {}),
     })
   }
   return { mode, visible, annotations }
 }
 
-export function createAnnotation(path: string, contents: string, offset: number, quote: string, comment = ""): Annotation {
+export function createAnnotation(path: string, contents: string, offset: number, quote: string, comment = "", suggestion?: string): Annotation {
   return {
     id: crypto.randomUUID(), path, quote,
     prefix: contents.slice(Math.max(0, offset - 40), offset),
     suffix: contents.slice(offset + quote.length, offset + quote.length + 40),
-    offset, comment, createdAt: new Date().toISOString(),
+    offset, comment, ...(suggestion === undefined ? {} : { suggestion }), createdAt: new Date().toISOString(),
   }
 }
 

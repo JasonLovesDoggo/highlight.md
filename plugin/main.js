@@ -46,6 +46,7 @@ function parseHighlightData(value) {
     if (!("suffix" in item) || typeof item.suffix !== "string") continue;
     if (!("offset" in item) || typeof item.offset !== "number" || !Number.isSafeInteger(item.offset) || item.offset < 0) continue;
     if (!("comment" in item) || typeof item.comment !== "string") continue;
+    if ("suggestion" in item && typeof item.suggestion !== "string") continue;
     if (!("createdAt" in item) || typeof item.createdAt !== "string") continue;
     annotations.push({
       id: item.id,
@@ -55,12 +56,13 @@ function parseHighlightData(value) {
       suffix: item.suffix,
       offset: item.offset,
       comment: item.comment,
-      createdAt: item.createdAt
+      createdAt: item.createdAt,
+      ...typeof item.suggestion === "string" ? { suggestion: item.suggestion } : {}
     });
   }
   return { mode, visible, annotations };
 }
-function createAnnotation(path, contents, offset, quote, comment = "") {
+function createAnnotation(path, contents, offset, quote, comment = "", suggestion) {
   return {
     id: crypto.randomUUID(),
     path,
@@ -69,6 +71,7 @@ function createAnnotation(path, contents, offset, quote, comment = "") {
     suffix: contents.slice(offset + quote.length, offset + quote.length + 40),
     offset,
     comment,
+    ...suggestion === void 0 ? {} : { suggestion },
     createdAt: (/* @__PURE__ */ new Date()).toISOString()
   };
 }
@@ -116,7 +119,6 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
   pendingSave = Promise.resolve();
   popover = null;
   popoverAnnotationId = null;
-  dismissedAnnotationId = null;
   popoverHideTimer = null;
   async onload() {
     this.data = parseHighlightData(await this.loadData());
@@ -141,7 +143,7 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
     });
     this.addCommand({
       id: "comment-selection",
-      name: "Comment on selected text",
+      name: "Add concept or comment to selected text",
       editorCallback: (editor, context) => {
         const path = context.file?.path;
         const quote = editor.getSelection();
@@ -160,6 +162,26 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
       }
     });
     this.addCommand({
+      id: "suggest-selection",
+      name: "Suggest edit for selected text",
+      editorCallback: (editor, context) => {
+        const path = context.file?.path;
+        const quote = editor.getSelection();
+        if (!path || !quote) {
+          new import_obsidian.Notice("Select text in a note first.");
+          return;
+        }
+        const offset = editor.posToOffset(editor.getCursor("from"));
+        new SuggestionModal(this.app, (suggestion, comment) => {
+          if (editor.getValue().slice(offset, offset + quote.length) !== quote) {
+            new import_obsidian.Notice("The selected text changed. Select it again before suggesting an edit.");
+            return;
+          }
+          void this.addAnnotation(path, editor.getValue(), offset, quote, comment, suggestion);
+        }).open();
+      }
+    });
+    this.addCommand({
       id: "show-annotations",
       name: "Show annotations in current note",
       callback: () => {
@@ -168,9 +190,16 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
           new import_obsidian.Notice("Open a Markdown note first.");
           return;
         }
-        new AnnotationsModal(this.app, this.data.annotations.filter((annotation) => annotation.path === path), (id) => {
-          void this.removeAnnotation(id);
-        }).open();
+        new AnnotationsModal(
+          this.app,
+          this.data.annotations.filter((annotation) => annotation.path === path),
+          (id) => {
+            void this.removeAnnotation(id);
+          },
+          (id) => {
+            void this.applySuggestion(id);
+          }
+        ).open();
       }
     });
     this.addCommand({
@@ -257,24 +286,29 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
     }
     editor.replaceSelection(highlightMarkup(quote));
   }
-  async addAnnotation(path, contents, offset, quote, comment = "") {
+  async addAnnotation(path, contents, offset, quote, comment = "", suggestion) {
     try {
-      const annotation = createAnnotation(path, contents, offset, quote, comment);
+      if (suggestion === quote) throw new Error("The replacement is identical to the selected text.");
+      const annotation = createAnnotation(path, contents, offset, quote, comment, suggestion);
       if (locateAnnotation(contents, annotation) !== offset) {
         throw new Error("This selection cannot be anchored uniquely. Select a longer passage.");
       }
       await this.updateData((data) => {
         const existing = data.annotations.find((current) => current.path === path && current.quote === quote && locateAnnotation(contents, current) === offset);
         if (existing) {
-          if (!comment) throw new Error("That selection already has an annotation.");
+          if (!comment && suggestion === void 0) throw new Error("That selection already has an annotation.");
           return {
             ...data,
-            annotations: data.annotations.map((current) => current.id === existing.id ? { ...current, comment } : current)
+            annotations: data.annotations.map((current) => current.id === existing.id ? {
+              ...current,
+              comment: comment || current.comment,
+              ...suggestion === void 0 ? {} : { suggestion }
+            } : current)
           };
         }
         return { ...data, annotations: [...data.annotations, annotation] };
       });
-      new import_obsidian.Notice(comment ? "Comment saved." : "Annotation highlight added.");
+      new import_obsidian.Notice(suggestion !== void 0 ? "Suggested edit saved." : comment ? "Comment saved." : "Annotation highlight added.");
     } catch (error) {
       new import_obsidian.Notice(error instanceof Error ? error.message : String(error));
     }
@@ -285,6 +319,38 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
       annotations: data.annotations.filter((annotation) => annotation.id !== id)
     }));
     new import_obsidian.Notice("Annotation removed.");
+  }
+  async applySuggestion(id) {
+    try {
+      await this.pendingSave;
+      const annotation = this.data.annotations.find((item) => item.id === id);
+      if (!annotation || annotation.suggestion === void 0) throw new Error("This suggestion is no longer available.");
+      const file = this.app.vault.getAbstractFileByPath(annotation.path);
+      if (!(file instanceof import_obsidian.TFile)) throw new Error("The note is no longer available.");
+      let openView = null;
+      for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+        if (leaf.view instanceof import_obsidian.MarkdownView && leaf.view.file?.path === annotation.path && leaf.view.getMode() === "source") {
+          openView = leaf.view;
+          break;
+        }
+      }
+      if (openView) {
+        const editor = openView.editor;
+        const offset = locateAnnotation(editor.getValue(), annotation);
+        if (offset === null) throw new Error("The selected text changed or is ambiguous. Review the note before applying.");
+        editor.replaceRange(annotation.suggestion, editor.offsetToPos(offset), editor.offsetToPos(offset + annotation.quote.length));
+      } else {
+        await this.app.vault.process(file, (contents) => {
+          const offset = locateAnnotation(contents, annotation);
+          if (offset === null) throw new Error("The selected text changed or is ambiguous. Review the note before applying.");
+          return `${contents.slice(0, offset)}${annotation.suggestion}${contents.slice(offset + annotation.quote.length)}`;
+        });
+      }
+      await this.updateData((data) => ({ ...data, annotations: data.annotations.filter((item) => item.id !== id) }));
+      new import_obsidian.Notice("Suggestion applied.");
+    } catch (error) {
+      new import_obsidian.Notice(error instanceof Error ? error.message : String(error));
+    }
   }
   async removeAllAnnotations() {
     await this.updateData((data) => ({ ...data, annotations: [] }));
@@ -352,9 +418,9 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
     if (!mark) return;
     this.cancelPopoverHide();
     const id = mark.dataset.annotationId;
-    if (!id || id === this.dismissedAnnotationId || id === this.popoverAnnotationId) return;
+    if (!id || id === this.popoverAnnotationId) return;
     const annotation = this.data.annotations.find((item) => item.id === id);
-    if (!annotation?.comment) return;
+    if (!annotation || !annotation.comment && annotation.suggestion === void 0) return;
     this.showPopover(mark, annotation);
   }
   onMouseOut(event) {
@@ -363,7 +429,6 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
     const card = this.popover?.contains(event.target) ? this.popover : null;
     if (!mark && !card) return;
     if (event.relatedTarget instanceof Node && (mark?.contains(event.relatedTarget) || card?.contains(event.relatedTarget))) return;
-    if (mark) this.dismissedAnnotationId = null;
     this.cancelPopoverHide();
     this.popoverHideTimer = window.setTimeout(() => this.hidePopover(), 150);
   }
@@ -373,20 +438,26 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
     card.className = "ai-highlight-comment-card";
     card.setAttribute("role", "dialog");
     card.setAttribute("aria-label", "Annotation comment");
-    const comment = document.createElement("div");
-    comment.className = "ai-highlight-comment-text";
-    comment.textContent = annotation.comment;
-    card.append(comment);
+    if (annotation.comment) {
+      const comment = document.createElement("div");
+      comment.className = "ai-highlight-comment-text";
+      comment.textContent = annotation.comment;
+      card.append(comment);
+    }
+    if (annotation.suggestion !== void 0) {
+      appendSuggestionDiff(card, annotation);
+    }
     const actions = document.createElement("div");
     actions.className = "ai-highlight-comment-actions";
-    const dismiss = document.createElement("button");
-    dismiss.type = "button";
-    dismiss.textContent = "Dismiss";
-    dismiss.addEventListener("click", () => {
-      this.dismissedAnnotationId = annotation.id;
-      this.hidePopover();
-    });
-    actions.append(dismiss);
+    if (annotation.suggestion !== void 0) {
+      const apply = document.createElement("button");
+      apply.type = "button";
+      apply.textContent = "Apply suggestion";
+      apply.addEventListener("click", () => {
+        void this.applySuggestion(annotation.id);
+      });
+      actions.append(apply);
+    }
     const remove = document.createElement("button");
     remove.type = "button";
     remove.textContent = "Remove annotation";
@@ -452,14 +523,41 @@ var CommentModal = class extends import_obsidian.Modal {
     this.contentEl.empty();
   }
 };
+var SuggestionModal = class extends import_obsidian.Modal {
+  constructor(app, submit) {
+    super(app);
+    this.submit = submit;
+  }
+  submit;
+  onOpen() {
+    this.setTitle("Suggest edit for selection");
+    let suggestion = null;
+    let comment = "";
+    new import_obsidian.Setting(this.contentEl).setName("Replacement text").setDesc("Leave the field empty to suggest deleting the selection.").addTextArea((input) => input.setPlaceholder("Replacement text").onChange((value) => {
+      suggestion = value;
+    }));
+    new import_obsidian.Setting(this.contentEl).setName("Comment").addTextArea((input) => input.setPlaceholder("Why this change?").onChange((value) => {
+      comment = value;
+    }));
+    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("Add suggestion").setCta().onClick(() => {
+      this.close();
+      this.submit(suggestion ?? "", comment.trim());
+    }));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
 var AnnotationsModal = class extends import_obsidian.Modal {
-  constructor(app, annotations, remove) {
+  constructor(app, annotations, remove, apply) {
     super(app);
     this.annotations = annotations;
     this.remove = remove;
+    this.apply = apply;
   }
   annotations;
   remove;
+  apply;
   onOpen() {
     this.setTitle("Annotations in this note");
     if (this.annotations.length === 0) {
@@ -467,16 +565,43 @@ var AnnotationsModal = class extends import_obsidian.Modal {
       return;
     }
     for (const annotation of this.annotations) {
-      new import_obsidian.Setting(this.contentEl).setName(annotation.quote.slice(0, 100)).setDesc(annotation.comment || "Highlight").addButton((button) => button.setButtonText("Remove").onClick(() => {
+      const setting = new import_obsidian.Setting(this.contentEl).setName(annotation.quote.slice(0, 100)).setDesc(annotation.comment || (annotation.suggestion === void 0 ? "Highlight" : "Suggested edit"));
+      if (annotation.suggestion !== void 0) {
+        setting.addButton((button) => button.setButtonText("Apply").onClick(() => {
+          this.apply(annotation.id);
+          this.close();
+        }));
+      }
+      setting.addButton((button) => button.setButtonText("Remove").onClick(() => {
         this.remove(annotation.id);
         this.close();
       }));
+      if (annotation.suggestion !== void 0) appendSuggestionDiff(this.contentEl, annotation);
     }
   }
   onClose() {
     this.contentEl.empty();
   }
 };
+function appendSuggestionDiff(parent, annotation) {
+  if (annotation.suggestion === void 0) return;
+  const diff = document.createElement("div");
+  diff.className = "ai-highlight-diff";
+  diff.setAttribute("aria-label", "Suggested edit");
+  for (const line of annotation.quote.split("\n")) {
+    const removed = document.createElement("div");
+    removed.className = "ai-highlight-diff-removed";
+    removed.textContent = `- ${line}`;
+    diff.append(removed);
+  }
+  for (const line of annotation.suggestion.split("\n")) {
+    const added = document.createElement("div");
+    added.className = "ai-highlight-diff-added";
+    added.textContent = `+ ${line}`;
+    diff.append(added);
+  }
+  parent.append(diff);
+}
 var ConfirmRemoveAllModal = class extends import_obsidian.Modal {
   constructor(app, count, confirm) {
     super(app);
