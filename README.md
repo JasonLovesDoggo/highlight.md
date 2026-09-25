@@ -17,6 +17,7 @@ Requires Node.js 20 or newer.
 ```sh
 npm install
 npm run build
+npm run typecheck
 ```
 
 The build creates `plugin/main.js` for Obsidian and `dist/mcp-server.js` for MCP clients.
