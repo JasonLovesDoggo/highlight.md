@@ -4,7 +4,7 @@ await Promise.all([
   build({
     entryPoints: ["src/plugin/main.ts"],
     bundle: true,
-    external: ["obsidian"],
+    external: ["obsidian", "@codemirror/state", "@codemirror/view"],
     format: "cjs",
     platform: "browser",
     target: "es2022",
