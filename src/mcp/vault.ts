@@ -23,6 +23,12 @@ export interface AnnotationResult {
   occurrence: number
   alreadyAnnotated: boolean
   commentUpdated: boolean
+  suggestionUpdated: boolean
+}
+
+export interface AppliedEditResult {
+  path: string
+  occurrence: number
 }
 
 export class VaultFiles {
@@ -72,25 +78,11 @@ export class VaultFiles {
     return this.serializeWrites(() => this.highlightUnlocked(relativePath, text, occurrence))
   }
 
-  async annotate(relativePath: string, text: string, occurrence?: number, comment = ""): Promise<AnnotationResult> {
+  async annotate(relativePath: string, text: string, occurrence?: number, comment = "", suggestion?: string): Promise<AnnotationResult> {
     return this.serializeWrites(async () => {
       const absolutePath = await this.resolveMarkdownFile(relativePath)
       const contents = await readFile(absolutePath, "utf8")
-      const offsets: number[] = []
-      let position = 0
-      while (position <= contents.length - text.length) {
-        const offset = contents.indexOf(text, position)
-        if (offset === -1) break
-        offsets.push(offset)
-        position = offset + text.length
-      }
-      if (offsets.length === 0) throw new Error(`The exact text was not found in ${relativePath}.`)
-      if (occurrence === undefined && offsets.length > 1) {
-        throw new Error(`Found ${offsets.length} matches. Pass occurrence (1-${offsets.length}) to choose one.`)
-      }
-      const selectedOccurrence = occurrence ?? 1
-      const offset = offsets[selectedOccurrence - 1]
-      if (offset === undefined) throw new Error(`Occurrence ${selectedOccurrence} is outside the ${offsets.length} matches.`)
+      const { offset, selectedOccurrence } = selectExactOccurrence(contents, text, occurrence, relativePath)
 
       const dataPath = await this.pluginDataPath()
       let data: HighlightData = { mode: "markdown", visible: true, annotations: [] }
@@ -103,22 +95,42 @@ export class VaultFiles {
       }
       const existing = data.annotations.find((annotation) => annotation.path === relativePath && annotation.quote === text && locateAnnotation(contents, annotation) === offset)
       if (existing) {
-        if (!comment || comment === existing.comment) {
-          return { path: relativePath, id: existing.id, occurrence: selectedOccurrence, alreadyAnnotated: true, commentUpdated: false }
+        const commentUpdated = Boolean(comment && comment !== existing.comment)
+        const suggestionUpdated = suggestion !== undefined && suggestion !== existing.suggestion
+        if (!commentUpdated && !suggestionUpdated) {
+          return { path: relativePath, id: existing.id, occurrence: selectedOccurrence, alreadyAnnotated: true, commentUpdated: false, suggestionUpdated: false }
         }
         await this.writePluginData(dataPath, {
           ...data,
-          annotations: data.annotations.map((annotation) => annotation.id === existing.id ? { ...annotation, comment } : annotation),
+          annotations: data.annotations.map((annotation) => annotation.id === existing.id ? {
+            ...annotation,
+            comment: comment || existing.comment,
+            ...(suggestion === undefined ? {} : { suggestion }),
+          } : annotation),
         })
-        return { path: relativePath, id: existing.id, occurrence: selectedOccurrence, alreadyAnnotated: true, commentUpdated: true }
+        return { path: relativePath, id: existing.id, occurrence: selectedOccurrence, alreadyAnnotated: true, commentUpdated, suggestionUpdated }
       }
-      const annotation = createAnnotation(relativePath, contents, offset, text, comment)
+      const annotation = createAnnotation(relativePath, contents, offset, text, comment, suggestion)
       if (locateAnnotation(contents, annotation) !== offset) {
         throw new Error("This selection cannot be anchored uniquely. Choose a longer passage.")
       }
       const updated = { ...data, annotations: [...data.annotations, annotation] }
       await this.writePluginData(dataPath, updated)
-      return { path: relativePath, id: annotation.id, occurrence: selectedOccurrence, alreadyAnnotated: false, commentUpdated: false }
+      return { path: relativePath, id: annotation.id, occurrence: selectedOccurrence, alreadyAnnotated: false, commentUpdated: false, suggestionUpdated: false }
+    })
+  }
+
+  async applyEdit(relativePath: string, text: string, replacement: string, occurrence?: number): Promise<AppliedEditResult> {
+    return this.serializeWrites(async () => {
+      const absolutePath = await this.resolveMarkdownFile(relativePath)
+      const original = await readFile(absolutePath, "utf8")
+      const { offset, selectedOccurrence } = selectExactOccurrence(original, text, occurrence, relativePath)
+      const updated = `${original.slice(0, offset)}${replacement}${original.slice(offset + text.length)}`
+      if (await readFile(absolutePath, "utf8") !== original) {
+        throw new Error(`The note changed while the edit was being prepared. Read ${relativePath} again and retry.`)
+      }
+      await this.replaceContents(absolutePath, updated)
+      return { path: relativePath, occurrence: selectedOccurrence }
     })
   }
 
@@ -271,6 +283,25 @@ export class VaultFiles {
       throw error
     }
   }
+}
+
+function selectExactOccurrence(contents: string, text: string, occurrence: number | undefined, relativePath: string): { offset: number; selectedOccurrence: number } {
+  const offsets: number[] = []
+  let position = 0
+  while (position <= contents.length - text.length) {
+    const offset = contents.indexOf(text, position)
+    if (offset === -1) break
+    offsets.push(offset)
+    position = offset + text.length
+  }
+  if (offsets.length === 0) throw new Error(`The exact text was not found in ${relativePath}.`)
+  if (occurrence === undefined && offsets.length > 1) {
+    throw new Error(`Found ${offsets.length} matches. Pass occurrence (1-${offsets.length}) to choose one.`)
+  }
+  const selectedOccurrence = occurrence ?? 1
+  const offset = offsets[selectedOccurrence - 1]
+  if (offset === undefined) throw new Error(`Occurrence ${selectedOccurrence} is outside the ${offsets.length} matches.`)
+  return { offset, selectedOccurrence }
 }
 
 interface Occurrence {

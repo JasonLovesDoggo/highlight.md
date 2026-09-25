@@ -19,6 +19,15 @@ interface HighlightTextInput {
   comment?: string
 }
 
+interface SuggestEditInput {
+  path: string
+  text: string
+  replacement: string
+  occurrence?: number
+  comment?: string
+  autoApply?: boolean
+}
+
 const searchNotesSchema = fromJsonSchema<SearchNotesInput>({
   type: "object",
   properties: {
@@ -51,6 +60,20 @@ const highlightTextSchema = fromJsonSchema<HighlightTextInput>({
   additionalProperties: false,
 })
 
+const suggestEditSchema = fromJsonSchema<SuggestEditInput>({
+  type: "object",
+  properties: {
+    path: { type: "string", minLength: 1, description: "Vault-relative Markdown note path." },
+    text: { type: "string", minLength: 1, description: "Exact text to replace. Read the note first." },
+    replacement: { type: "string", description: "Replacement text. Empty text proposes or applies a deletion." },
+    occurrence: { type: "integer", minimum: 1, description: "1-based exact match when the text appears more than once." },
+    comment: { type: "string", description: "Optional concept or reason for this edit." },
+    autoApply: { type: "boolean", description: "When true, write the replacement into the note immediately instead of saving a review suggestion. Defaults to false." },
+  },
+  required: ["path", "text", "replacement"],
+  additionalProperties: false,
+})
+
 function configuredVaultPath(): string {
   const argumentIndex = process.argv.indexOf("--vault")
   const argumentPath = argumentIndex >= 0 ? process.argv[argumentIndex + 1] : undefined
@@ -64,10 +87,10 @@ function configuredVaultPath(): string {
 async function main(): Promise<void> {
   const vault = await VaultFiles.open(configuredVaultPath())
   const server = new McpServer(
-    { name: "obsidian-highlight", version: "0.2.0" },
+    { name: "obsidian-highlight", version: "0.3.0" },
     {
       instructions:
-        "Use search_notes or read_note to confirm the target and exact text before calling highlight_text. Paths are relative to the configured Obsidian vault. If a phrase has multiple exact matches, specify its occurrence. Set mode to overlay for a highlight or comment that leaves the Markdown note untouched. Save open notes in Obsidian before using markdown mode.",
+        "Use search_notes or read_note to confirm the target and exact text before making a change. Paths are relative to the configured Obsidian vault. If a phrase has multiple exact matches, specify its occurrence. Use highlight_text in overlay mode for a concept or comment without changing the note. Use suggest_edit to store a proposed replacement as a reviewable diff; set autoApply true only when asked to write the note immediately. Save open notes in Obsidian before using markdown mode or autoApply.",
     },
   )
 
@@ -140,6 +163,36 @@ async function main(): Promise<void> {
         const message = result.alreadyHighlighted
           ? `That text is already highlighted in ${result.path} (occurrence ${result.occurrence}).`
           : `Highlighted occurrence ${result.occurrence} in ${result.path}.`
+        return { content: [{ type: "text", text: message }] }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { content: [{ type: "text", text: message }], isError: true }
+      }
+    },
+  )
+
+  server.registerTool(
+    "suggest_edit",
+    {
+      description: "Suggest an exact-text replacement as a rendered diff in Obsidian, or apply it immediately when autoApply is true. No separate preview step.",
+      inputSchema: suggestEditSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ path, text, replacement, occurrence, comment, autoApply }) => {
+      if (replacement === text) {
+        return { content: [{ type: "text", text: "Replacement is identical to the selected text." }], isError: true }
+      }
+      try {
+        if (autoApply) {
+          const result = await vault.applyEdit(path, text, replacement, occurrence)
+          return { content: [{ type: "text", text: `Applied occurrence ${result.occurrence} in ${result.path}.` }] }
+        }
+        const result = await vault.annotate(path, text, occurrence, comment, replacement)
+        const message = result.suggestionUpdated
+          ? `Updated suggestion ${result.id} in ${result.path}.`
+          : result.alreadyAnnotated
+          ? `That selection already has suggestion ${result.id} in ${result.path}.`
+          : `Saved suggestion ${result.id} for occurrence ${result.occurrence} in ${result.path}. The note was not changed.`
         return { content: [{ type: "text", text: message }] }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)

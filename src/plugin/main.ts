@@ -1,6 +1,6 @@
 import { StateEffect } from "@codemirror/state"
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate } from "@codemirror/view"
-import { App, Editor, editorInfoField, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from "obsidian"
+import { App, Editor, editorInfoField, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from "obsidian"
 import { Annotation, createAnnotation, HighlightData, locateAnnotation, parseHighlightData } from "../annotations.js"
 import { highlightMarkup, isHighlightAround } from "../markup.js"
 
@@ -12,7 +12,6 @@ export default class AiHighlightPlugin extends Plugin {
   private pendingSave: Promise<void> = Promise.resolve()
   private popover: HTMLElement | null = null
   private popoverAnnotationId: string | null = null
-  private dismissedAnnotationId: string | null = null
   private popoverHideTimer: number | null = null
 
   async onload(): Promise<void> {
@@ -38,7 +37,7 @@ export default class AiHighlightPlugin extends Plugin {
     })
     this.addCommand({
       id: "comment-selection",
-      name: "Comment on selected text",
+      name: "Add concept or comment to selected text",
       editorCallback: (editor, context) => {
         const path = context.file?.path
         const quote = editor.getSelection()
@@ -57,6 +56,26 @@ export default class AiHighlightPlugin extends Plugin {
       },
     })
     this.addCommand({
+      id: "suggest-selection",
+      name: "Suggest edit for selected text",
+      editorCallback: (editor, context) => {
+        const path = context.file?.path
+        const quote = editor.getSelection()
+        if (!path || !quote) {
+          new Notice("Select text in a note first.")
+          return
+        }
+        const offset = editor.posToOffset(editor.getCursor("from"))
+        new SuggestionModal(this.app, (suggestion, comment) => {
+          if (editor.getValue().slice(offset, offset + quote.length) !== quote) {
+            new Notice("The selected text changed. Select it again before suggesting an edit.")
+            return
+          }
+          void this.addAnnotation(path, editor.getValue(), offset, quote, comment, suggestion)
+        }).open()
+      },
+    })
+    this.addCommand({
       id: "show-annotations",
       name: "Show annotations in current note",
       callback: () => {
@@ -65,9 +84,12 @@ export default class AiHighlightPlugin extends Plugin {
           new Notice("Open a Markdown note first.")
           return
         }
-        new AnnotationsModal(this.app, this.data.annotations.filter((annotation) => annotation.path === path), (id) => {
-          void this.removeAnnotation(id)
-        }).open()
+        new AnnotationsModal(
+          this.app,
+          this.data.annotations.filter((annotation) => annotation.path === path),
+          (id) => { void this.removeAnnotation(id) },
+          (id) => { void this.applySuggestion(id) },
+        ).open()
       },
     })
     this.addCommand({
@@ -159,24 +181,29 @@ export default class AiHighlightPlugin extends Plugin {
     editor.replaceSelection(highlightMarkup(quote))
   }
 
-  private async addAnnotation(path: string, contents: string, offset: number, quote: string, comment = ""): Promise<void> {
+  private async addAnnotation(path: string, contents: string, offset: number, quote: string, comment = "", suggestion?: string): Promise<void> {
     try {
-      const annotation = createAnnotation(path, contents, offset, quote, comment)
+      if (suggestion === quote) throw new Error("The replacement is identical to the selected text.")
+      const annotation = createAnnotation(path, contents, offset, quote, comment, suggestion)
       if (locateAnnotation(contents, annotation) !== offset) {
         throw new Error("This selection cannot be anchored uniquely. Select a longer passage.")
       }
       await this.updateData((data) => {
         const existing = data.annotations.find((current) => current.path === path && current.quote === quote && locateAnnotation(contents, current) === offset)
         if (existing) {
-          if (!comment) throw new Error("That selection already has an annotation.")
+          if (!comment && suggestion === undefined) throw new Error("That selection already has an annotation.")
           return {
             ...data,
-            annotations: data.annotations.map((current) => current.id === existing.id ? { ...current, comment } : current),
+            annotations: data.annotations.map((current) => current.id === existing.id ? {
+              ...current,
+              comment: comment || current.comment,
+              ...(suggestion === undefined ? {} : { suggestion }),
+            } : current),
           }
         }
         return { ...data, annotations: [...data.annotations, annotation] }
       })
-      new Notice(comment ? "Comment saved." : "Annotation highlight added.")
+      new Notice(suggestion !== undefined ? "Suggested edit saved." : comment ? "Comment saved." : "Annotation highlight added.")
     } catch (error) {
       new Notice(error instanceof Error ? error.message : String(error))
     }
@@ -188,6 +215,40 @@ export default class AiHighlightPlugin extends Plugin {
       annotations: data.annotations.filter((annotation) => annotation.id !== id),
     }))
     new Notice("Annotation removed.")
+  }
+
+  private async applySuggestion(id: string): Promise<void> {
+    try {
+      await this.pendingSave
+      const annotation = this.data.annotations.find((item) => item.id === id)
+      if (!annotation || annotation.suggestion === undefined) throw new Error("This suggestion is no longer available.")
+      const file = this.app.vault.getAbstractFileByPath(annotation.path)
+      if (!(file instanceof TFile)) throw new Error("The note is no longer available.")
+
+      let openView: MarkdownView | null = null
+      for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+        if (leaf.view instanceof MarkdownView && leaf.view.file?.path === annotation.path && leaf.view.getMode() === "source") {
+          openView = leaf.view
+          break
+        }
+      }
+      if (openView) {
+        const editor = openView.editor
+        const offset = locateAnnotation(editor.getValue(), annotation)
+        if (offset === null) throw new Error("The selected text changed or is ambiguous. Review the note before applying.")
+        editor.replaceRange(annotation.suggestion, editor.offsetToPos(offset), editor.offsetToPos(offset + annotation.quote.length))
+      } else {
+        await this.app.vault.process(file, (contents) => {
+          const offset = locateAnnotation(contents, annotation)
+          if (offset === null) throw new Error("The selected text changed or is ambiguous. Review the note before applying.")
+          return `${contents.slice(0, offset)}${annotation.suggestion}${contents.slice(offset + annotation.quote.length)}`
+        })
+      }
+      await this.updateData((data) => ({ ...data, annotations: data.annotations.filter((item) => item.id !== id) }))
+      new Notice("Suggestion applied.")
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : String(error))
+    }
   }
 
   private async removeAllAnnotations(): Promise<void> {
@@ -263,9 +324,9 @@ export default class AiHighlightPlugin extends Plugin {
     if (!mark) return
     this.cancelPopoverHide()
     const id = mark.dataset.annotationId
-    if (!id || id === this.dismissedAnnotationId || id === this.popoverAnnotationId) return
+    if (!id || id === this.popoverAnnotationId) return
     const annotation = this.data.annotations.find((item) => item.id === id)
-    if (!annotation?.comment) return
+    if (!annotation || (!annotation.comment && annotation.suggestion === undefined)) return
     this.showPopover(mark, annotation)
   }
 
@@ -275,7 +336,6 @@ export default class AiHighlightPlugin extends Plugin {
     const card = this.popover?.contains(event.target) ? this.popover : null
     if (!mark && !card) return
     if (event.relatedTarget instanceof Node && (mark?.contains(event.relatedTarget) || card?.contains(event.relatedTarget))) return
-    if (mark) this.dismissedAnnotationId = null
     this.cancelPopoverHide()
     this.popoverHideTimer = window.setTimeout(() => this.hidePopover(), 150)
   }
@@ -286,20 +346,24 @@ export default class AiHighlightPlugin extends Plugin {
     card.className = "ai-highlight-comment-card"
     card.setAttribute("role", "dialog")
     card.setAttribute("aria-label", "Annotation comment")
-    const comment = document.createElement("div")
-    comment.className = "ai-highlight-comment-text"
-    comment.textContent = annotation.comment
-    card.append(comment)
+    if (annotation.comment) {
+      const comment = document.createElement("div")
+      comment.className = "ai-highlight-comment-text"
+      comment.textContent = annotation.comment
+      card.append(comment)
+    }
+    if (annotation.suggestion !== undefined) {
+      appendSuggestionDiff(card, annotation)
+    }
     const actions = document.createElement("div")
     actions.className = "ai-highlight-comment-actions"
-    const dismiss = document.createElement("button")
-    dismiss.type = "button"
-    dismiss.textContent = "Dismiss"
-    dismiss.addEventListener("click", () => {
-      this.dismissedAnnotationId = annotation.id
-      this.hidePopover()
-    })
-    actions.append(dismiss)
+    if (annotation.suggestion !== undefined) {
+      const apply = document.createElement("button")
+      apply.type = "button"
+      apply.textContent = "Apply suggestion"
+      apply.addEventListener("click", () => { void this.applySuggestion(annotation.id) })
+      actions.append(apply)
+    }
     const remove = document.createElement("button")
     remove.type = "button"
     remove.textContent = "Remove annotation"
@@ -377,11 +441,44 @@ class CommentModal extends Modal {
   }
 }
 
+class SuggestionModal extends Modal {
+  constructor(app: App, private readonly submit: (suggestion: string, comment: string) => void) {
+    super(app)
+  }
+  onOpen(): void {
+    this.setTitle("Suggest edit for selection")
+    let suggestion: string | null = null
+    let comment = ""
+    new Setting(this.contentEl)
+      .setName("Replacement text")
+      .setDesc("Leave the field empty to suggest deleting the selection.")
+      .addTextArea((input) => input
+        .setPlaceholder("Replacement text")
+        .onChange((value) => { suggestion = value }))
+    new Setting(this.contentEl)
+      .setName("Comment")
+      .addTextArea((input) => input
+        .setPlaceholder("Why this change?")
+        .onChange((value) => { comment = value }))
+    new Setting(this.contentEl).addButton((button) => button
+      .setButtonText("Add suggestion")
+      .setCta()
+      .onClick(() => {
+        this.close()
+        this.submit(suggestion ?? "", comment.trim())
+      }))
+  }
+  onClose(): void {
+    this.contentEl.empty()
+  }
+}
+
 class AnnotationsModal extends Modal {
   constructor(
     app: App,
     private readonly annotations: Annotation[],
     private readonly remove: (id: string) => void,
+    private readonly apply: (id: string) => void,
   ) {
     super(app)
   }
@@ -392,20 +489,47 @@ class AnnotationsModal extends Modal {
       return
     }
     for (const annotation of this.annotations) {
-      new Setting(this.contentEl)
+      const setting = new Setting(this.contentEl)
         .setName(annotation.quote.slice(0, 100))
-        .setDesc(annotation.comment || "Highlight")
-        .addButton((button) => button
-          .setButtonText("Remove")
-          .onClick(() => {
-            this.remove(annotation.id)
-            this.close()
-          }))
+        .setDesc(annotation.comment || (annotation.suggestion === undefined ? "Highlight" : "Suggested edit"))
+      if (annotation.suggestion !== undefined) {
+        setting.addButton((button) => button.setButtonText("Apply").onClick(() => {
+          this.apply(annotation.id)
+          this.close()
+        }))
+      }
+      setting.addButton((button) => button
+        .setButtonText("Remove")
+        .onClick(() => {
+          this.remove(annotation.id)
+          this.close()
+        }))
+      if (annotation.suggestion !== undefined) appendSuggestionDiff(this.contentEl, annotation)
     }
   }
   onClose(): void {
     this.contentEl.empty()
   }
+}
+
+function appendSuggestionDiff(parent: HTMLElement, annotation: Annotation): void {
+  if (annotation.suggestion === undefined) return
+  const diff = document.createElement("div")
+  diff.className = "ai-highlight-diff"
+  diff.setAttribute("aria-label", "Suggested edit")
+  for (const line of annotation.quote.split("\n")) {
+    const removed = document.createElement("div")
+    removed.className = "ai-highlight-diff-removed"
+    removed.textContent = `- ${line}`
+    diff.append(removed)
+  }
+  for (const line of annotation.suggestion.split("\n")) {
+    const added = document.createElement("div")
+    added.className = "ai-highlight-diff-added"
+    added.textContent = `+ ${line}`
+    diff.append(added)
+  }
+  parent.append(diff)
 }
 
 class ConfirmRemoveAllModal extends Modal {
