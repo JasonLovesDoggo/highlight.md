@@ -16,6 +16,11 @@ export default class AiHighlightPlugin extends Plugin {
 
   async onload(): Promise<void> {
     this.data = parseHighlightData(await this.loadData())
+    this.registerInterval(window.setInterval(() => {
+      void this.reloadExternalData().catch((error: unknown) => {
+        console.error("AI Highlight could not reload external annotations.", error)
+      })
+    }, 2000))
     this.addSettingTab(new HighlightSettingsTab(this.app, this))
     this.registerEditorExtension(this.annotationExtension())
     this.registerDomEvent(document, "mouseover", (event) => this.onMouseOver(event))
@@ -90,8 +95,15 @@ export default class AiHighlightPlugin extends Plugin {
   }
 
   async onExternalSettingsChange(): Promise<void> {
+    await this.reloadExternalData()
+  }
+
+  private async reloadExternalData(): Promise<void> {
     await this.pendingSave
-    this.data = parseHighlightData(await this.loadData())
+    const latest = parseHighlightData(await this.loadData())
+    if (JSON.stringify(latest) === JSON.stringify(this.data)) return
+    this.data = latest
+    this.hidePopover()
     this.refreshEditors()
   }
 

@@ -119,6 +119,11 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
   dismissedAnnotationId = null;
   async onload() {
     this.data = parseHighlightData(await this.loadData());
+    this.registerInterval(window.setInterval(() => {
+      void this.reloadExternalData().catch((error) => {
+        console.error("AI Highlight could not reload external annotations.", error);
+      });
+    }, 2e3));
     this.addSettingTab(new HighlightSettingsTab(this.app, this));
     this.registerEditorExtension(this.annotationExtension());
     this.registerDomEvent(document, "mouseover", (event) => this.onMouseOver(event));
@@ -195,8 +200,14 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
     this.hidePopover();
   }
   async onExternalSettingsChange() {
+    await this.reloadExternalData();
+  }
+  async reloadExternalData() {
     await this.pendingSave;
-    this.data = parseHighlightData(await this.loadData());
+    const latest = parseHighlightData(await this.loadData());
+    if (JSON.stringify(latest) === JSON.stringify(this.data)) return;
+    this.data = latest;
+    this.hidePopover();
     this.refreshEditors();
   }
   get mode() {
