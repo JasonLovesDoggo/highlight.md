@@ -17,12 +17,6 @@
   box-shadow: var(--shadow-l);
 }
 
-.ai-highlight-comment-quote {
-  margin-bottom: 8px;
-  color: var(--text-muted);
-  font-size: var(--font-small);
-}
-
 .ai-highlight-comment-text {
   white-space: pre-wrap;
 }

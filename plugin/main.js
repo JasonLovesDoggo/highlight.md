@@ -117,6 +117,7 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
   popover = null;
   popoverAnnotationId = null;
   dismissedAnnotationId = null;
+  popoverHideTimer = null;
   async onload() {
     this.data = parseHighlightData(await this.loadData());
     this.registerInterval(window.setInterval(() => {
@@ -343,8 +344,13 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
   }
   onMouseOver(event) {
     if (!this.data.visible || !(event.target instanceof Element)) return;
+    if (this.popover?.contains(event.target)) {
+      this.cancelPopoverHide();
+      return;
+    }
     const mark = event.target.closest(".ai-highlight-annotation");
     if (!mark) return;
+    this.cancelPopoverHide();
     const id = mark.dataset.annotationId;
     if (!id || id === this.dismissedAnnotationId || id === this.popoverAnnotationId) return;
     const annotation = this.data.annotations.find((item) => item.id === id);
@@ -354,9 +360,12 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
   onMouseOut(event) {
     if (!(event.target instanceof Element)) return;
     const mark = event.target.closest(".ai-highlight-annotation");
-    if (!mark) return;
-    if (event.relatedTarget instanceof Node && mark.contains(event.relatedTarget)) return;
-    this.dismissedAnnotationId = null;
+    const card = this.popover?.contains(event.target) ? this.popover : null;
+    if (!mark && !card) return;
+    if (event.relatedTarget instanceof Node && (mark?.contains(event.relatedTarget) || card?.contains(event.relatedTarget))) return;
+    if (mark) this.dismissedAnnotationId = null;
+    this.cancelPopoverHide();
+    this.popoverHideTimer = window.setTimeout(() => this.hidePopover(), 150);
   }
   showPopover(mark, annotation) {
     this.hidePopover();
@@ -364,10 +373,6 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
     card.className = "ai-highlight-comment-card";
     card.setAttribute("role", "dialog");
     card.setAttribute("aria-label", "Annotation comment");
-    const quote = document.createElement("div");
-    quote.className = "ai-highlight-comment-quote";
-    quote.textContent = annotation.quote.length > 120 ? `${annotation.quote.slice(0, 120)}\u2026` : annotation.quote;
-    card.append(quote);
     const comment = document.createElement("div");
     comment.className = "ai-highlight-comment-text";
     comment.textContent = annotation.comment;
@@ -398,9 +403,15 @@ var AiHighlightPlugin = class extends import_obsidian.Plugin {
     this.popoverAnnotationId = annotation.id;
   }
   hidePopover() {
+    this.cancelPopoverHide();
     this.popover?.remove();
     this.popover = null;
     this.popoverAnnotationId = null;
+  }
+  cancelPopoverHide() {
+    if (this.popoverHideTimer === null) return;
+    window.clearTimeout(this.popoverHideTimer);
+    this.popoverHideTimer = null;
   }
 };
 var HighlightSettingsTab = class extends import_obsidian.PluginSettingTab {

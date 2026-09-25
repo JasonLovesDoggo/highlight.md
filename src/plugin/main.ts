@@ -13,6 +13,7 @@ export default class AiHighlightPlugin extends Plugin {
   private popover: HTMLElement | null = null
   private popoverAnnotationId: string | null = null
   private dismissedAnnotationId: string | null = null
+  private popoverHideTimer: number | null = null
 
   async onload(): Promise<void> {
     this.data = parseHighlightData(await this.loadData())
@@ -254,8 +255,13 @@ export default class AiHighlightPlugin extends Plugin {
 
   private onMouseOver(event: MouseEvent): void {
     if (!this.data.visible || !(event.target instanceof Element)) return
+    if (this.popover?.contains(event.target)) {
+      this.cancelPopoverHide()
+      return
+    }
     const mark = event.target.closest<HTMLElement>(".ai-highlight-annotation")
     if (!mark) return
+    this.cancelPopoverHide()
     const id = mark.dataset.annotationId
     if (!id || id === this.dismissedAnnotationId || id === this.popoverAnnotationId) return
     const annotation = this.data.annotations.find((item) => item.id === id)
@@ -266,9 +272,12 @@ export default class AiHighlightPlugin extends Plugin {
   private onMouseOut(event: MouseEvent): void {
     if (!(event.target instanceof Element)) return
     const mark = event.target.closest<HTMLElement>(".ai-highlight-annotation")
-    if (!mark) return
-    if (event.relatedTarget instanceof Node && mark.contains(event.relatedTarget)) return
-    this.dismissedAnnotationId = null
+    const card = this.popover?.contains(event.target) ? this.popover : null
+    if (!mark && !card) return
+    if (event.relatedTarget instanceof Node && (mark?.contains(event.relatedTarget) || card?.contains(event.relatedTarget))) return
+    if (mark) this.dismissedAnnotationId = null
+    this.cancelPopoverHide()
+    this.popoverHideTimer = window.setTimeout(() => this.hidePopover(), 150)
   }
 
   private showPopover(mark: HTMLElement, annotation: Annotation): void {
@@ -277,10 +286,6 @@ export default class AiHighlightPlugin extends Plugin {
     card.className = "ai-highlight-comment-card"
     card.setAttribute("role", "dialog")
     card.setAttribute("aria-label", "Annotation comment")
-    const quote = document.createElement("div")
-    quote.className = "ai-highlight-comment-quote"
-    quote.textContent = annotation.quote.length > 120 ? `${annotation.quote.slice(0, 120)}…` : annotation.quote
-    card.append(quote)
     const comment = document.createElement("div")
     comment.className = "ai-highlight-comment-text"
     comment.textContent = annotation.comment
@@ -310,9 +315,16 @@ export default class AiHighlightPlugin extends Plugin {
   }
 
   private hidePopover(): void {
+    this.cancelPopoverHide()
     this.popover?.remove()
     this.popover = null
     this.popoverAnnotationId = null
+  }
+
+  private cancelPopoverHide(): void {
+    if (this.popoverHideTimer === null) return
+    window.clearTimeout(this.popoverHideTimer)
+    this.popoverHideTimer = null
   }
 }
 
