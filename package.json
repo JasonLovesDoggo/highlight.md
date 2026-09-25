@@ -1,6 +1,6 @@
 {
   "name": "obsidian-highlight-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "type": "module",
   "description": "Highlight exact text in Obsidian notes, manually or through Claude and Codex MCP tools.",
@@ -12,6 +12,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@codemirror/state": "6.5.0",
+    "@codemirror/view": "6.38.6",
     "@modelcontextprotocol/server": "^2.0.0"
   },
   "devDependencies": {

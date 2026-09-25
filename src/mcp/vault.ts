@@ -1,5 +1,6 @@
-import { lstat, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises"
+import { lstat, mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises"
 import path from "node:path"
+import { createAnnotation, HighlightData, locateAnnotation, parseHighlightData } from "../annotations.js"
 import { highlightMarkup, isHighlightAround } from "../markup.js"
 
 const ignoredDirectories = new Set([".git", ".obsidian", "node_modules", ".trash"])
@@ -14,6 +15,13 @@ export interface HighlightResult {
   path: string
   occurrence: number
   alreadyHighlighted: boolean
+}
+
+export interface AnnotationResult {
+  path: string
+  id: string
+  occurrence: number
+  alreadyAnnotated: boolean
 }
 
 export class VaultFiles {
@@ -61,6 +69,73 @@ export class VaultFiles {
 
   async highlight(relativePath: string, text: string, occurrence?: number): Promise<HighlightResult> {
     return this.serializeWrites(() => this.highlightUnlocked(relativePath, text, occurrence))
+  }
+
+  async annotate(relativePath: string, text: string, occurrence?: number, comment = ""): Promise<AnnotationResult> {
+    return this.serializeWrites(async () => {
+      const absolutePath = await this.resolveMarkdownFile(relativePath)
+      const contents = await readFile(absolutePath, "utf8")
+      const offsets: number[] = []
+      let position = 0
+      while (position <= contents.length - text.length) {
+        const offset = contents.indexOf(text, position)
+        if (offset === -1) break
+        offsets.push(offset)
+        position = offset + text.length
+      }
+      if (offsets.length === 0) throw new Error(`The exact text was not found in ${relativePath}.`)
+      if (occurrence === undefined && offsets.length > 1) {
+        throw new Error(`Found ${offsets.length} matches. Pass occurrence (1-${offsets.length}) to choose one.`)
+      }
+      const selectedOccurrence = occurrence ?? 1
+      const offset = offsets[selectedOccurrence - 1]
+      if (offset === undefined) throw new Error(`Occurrence ${selectedOccurrence} is outside the ${offsets.length} matches.`)
+
+      const dataPath = await this.pluginDataPath()
+      let data: HighlightData = { mode: "markdown", annotations: [] }
+      try {
+        const info = await lstat(dataPath)
+        if (!info.isFile() || info.isSymbolicLink()) throw new Error("Plugin data must be a regular file.")
+        data = parseHighlightData(JSON.parse(await readFile(dataPath, "utf8")))
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error
+      }
+      const existing = data.annotations.find((annotation) => annotation.path === relativePath && annotation.quote === text && locateAnnotation(contents, annotation) === offset)
+      if (existing) {
+        return { path: relativePath, id: existing.id, occurrence: selectedOccurrence, alreadyAnnotated: true }
+      }
+      const annotation = createAnnotation(relativePath, contents, offset, text, comment)
+      if (locateAnnotation(contents, annotation) !== offset) {
+        throw new Error("This selection cannot be anchored uniquely. Choose a longer passage.")
+      }
+      const updated = { ...data, annotations: [...data.annotations, annotation] }
+      const temporaryPath = `${dataPath}.${process.pid}.${Date.now()}.tmp`
+      try {
+        await writeFile(temporaryPath, JSON.stringify(updated, null, 2), { encoding: "utf8", flag: "wx" })
+        await rename(temporaryPath, dataPath)
+      } catch (error) {
+        await unlink(temporaryPath).catch(() => undefined)
+        throw error
+      }
+      return { path: relativePath, id: annotation.id, occurrence: selectedOccurrence, alreadyAnnotated: false }
+    })
+  }
+
+  private async pluginDataPath(): Promise<string> {
+    let current = this.root
+    for (const component of [".obsidian", "plugins", "ai-highlight"]) {
+      current = path.join(current, component)
+      try {
+        await mkdir(current)
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error
+      }
+      const info = await lstat(current)
+      if (!info.isDirectory() || info.isSymbolicLink()) {
+        throw new Error("The Obsidian plugin data directory must not contain symlinks.")
+      }
+    }
+    return path.join(current, "data.json")
   }
 
   private async highlightUnlocked(relativePath: string, text: string, occurrence?: number): Promise<HighlightResult> {

@@ -15,6 +15,8 @@ interface HighlightTextInput {
   path: string
   text: string
   occurrence?: number
+  mode?: "markdown" | "overlay"
+  comment?: string
 }
 
 const searchNotesSchema = fromJsonSchema<SearchNotesInput>({
@@ -42,6 +44,8 @@ const highlightTextSchema = fromJsonSchema<HighlightTextInput>({
     path: { type: "string", minLength: 1, description: "Vault-relative Markdown note path." },
     text: { type: "string", minLength: 1, description: "Exact, single-line text to highlight." },
     occurrence: { type: "integer", minimum: 1, description: "1-based exact match to highlight when text appears more than once." },
+    mode: { type: "string", enum: ["markdown", "overlay"], description: "Markdown changes the note. Overlay stores an annotation without changing the note. Defaults to markdown." },
+    comment: { type: "string", description: "Optional comment for overlay mode." },
   },
   required: ["path", "text"],
   additionalProperties: false,
@@ -60,10 +64,10 @@ function configuredVaultPath(): string {
 async function main(): Promise<void> {
   const vault = await VaultFiles.open(configuredVaultPath())
   const server = new McpServer(
-    { name: "obsidian-highlight", version: "0.1.0" },
+    { name: "obsidian-highlight", version: "0.2.0" },
     {
       instructions:
-        "Use search_notes or read_note to confirm the target and exact text before calling highlight_text. Paths are relative to the configured Obsidian vault. If a phrase has multiple exact matches, specify its occurrence. Save open notes in Obsidian before using the file-writing tool.",
+        "Use search_notes or read_note to confirm the target and exact text before calling highlight_text. Paths are relative to the configured Obsidian vault. If a phrase has multiple exact matches, specify its occurrence. Set mode to overlay for a highlight or comment that leaves the Markdown note untouched. Save open notes in Obsidian before using markdown mode.",
     },
   )
 
@@ -110,16 +114,26 @@ async function main(): Promise<void> {
     "highlight_text",
     {
       description:
-        "Wrap one exact, single-line occurrence in Obsidian highlight syntax (==text==). Read the note first. This writes the note on disk; save open editor changes before calling.",
+        "Highlight one exact occurrence. Markdown mode writes ==text== into the note; overlay mode stores a separate annotation and can include a comment. Read the note first.",
       inputSchema: highlightTextSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async ({ path, text, occurrence }) => {
-      if (text.includes("\n") || text.includes("\r")) {
+    async ({ path, text, occurrence, mode, comment }) => {
+      if ((mode ?? "markdown") === "markdown" && (text.includes("\n") || text.includes("\r"))) {
         return { content: [{ type: "text", text: "Highlight one line at a time." }], isError: true }
+      }
+      if (comment && mode !== "overlay") {
+        return { content: [{ type: "text", text: "Comments require overlay mode." }], isError: true }
       }
 
       try {
+        if (mode === "overlay") {
+          const result = await vault.annotate(path, text, occurrence, comment)
+          const message = result.alreadyAnnotated
+            ? `That selection already has an annotation in ${result.path} (ID ${result.id}).`
+            : `Annotated occurrence ${result.occurrence} in ${result.path} without changing the note (ID ${result.id}).`
+          return { content: [{ type: "text", text: message }] }
+        }
         const result = await vault.highlight(path, text, occurrence)
         const message = result.alreadyHighlighted
           ? `That text is already highlighted in ${result.path} (occurrence ${result.occurrence}).`
