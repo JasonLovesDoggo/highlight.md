@@ -1,0 +1,9 @@
+{
+  "id": "ai-highlight",
+  "name": "AI Highlight",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Highlight selected text in Markdown notes and pair with a local MCP server.",
+  "author": "Jason Loves Doggo",
+  "isDesktopOnly": false
+}
